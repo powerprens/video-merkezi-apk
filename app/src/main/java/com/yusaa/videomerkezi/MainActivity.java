@@ -3,6 +3,10 @@ package com.yusaa.videomerkezi;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.app.ProgressDialog;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -14,6 +18,8 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
 import android.view.Menu;
 import android.view.MenuItem;
@@ -37,6 +43,8 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
+import java.util.Set;
 
 /**
  * Video Merkezi: sunucudaki video uretim panelini WebView ile acar.
@@ -55,6 +63,17 @@ public class MainActivity extends Activity {
     private boolean updateChecked = false;
     private long pendingDownloadId = -1;
     private BroadcastReceiver downloadReceiver;
+
+    // ---- Is bildirimleri (uygulama acikken yoklama) ----
+    private static final String CH_JOBS = "isler";
+    private static final String KEY_SEEN = "gorulen_biten";
+    private final Handler jobHandler = new Handler(Looper.getMainLooper());
+    private final Runnable jobPoller = new Runnable() {
+        @Override public void run() {
+            pollJobs();
+            jobHandler.postDelayed(this, 20000);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -94,6 +113,112 @@ public class MainActivity extends Activity {
         webView.setWebChromeClient(new WebChromeClient());
 
         loadServer();
+        ensureJobChannel();
+        askNotifPermission();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        jobHandler.removeCallbacks(jobPoller);
+        jobHandler.post(jobPoller);
+    }
+
+    @Override
+    protected void onPause() {
+        jobHandler.removeCallbacks(jobPoller);
+        super.onPause();
+    }
+
+    // ---- Is bildirimleri ----
+
+    private void ensureJobChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (nm.getNotificationChannel(CH_JOBS) == null) {
+                nm.createNotificationChannel(new NotificationChannel(
+                        CH_JOBS, "Is durumu", NotificationManager.IMPORTANCE_DEFAULT));
+            }
+        }
+    }
+
+    private void askNotifPermission() {
+        if (Build.VERSION.SDK_INT >= 33) {
+            if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                    != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(
+                        new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 41);
+            }
+        }
+    }
+
+    private void pollJobs() {
+        final String base = serverUrl();
+        new Thread(() -> {
+            HttpURLConnection c = null;
+            try {
+                URL url = new URL(base + "/api/jobs");
+                c = (HttpURLConnection) url.openConnection();
+                c.setConnectTimeout(10000);
+                c.setReadTimeout(10000);
+                if (c.getResponseCode() != 200) return;
+                BufferedReader r = new BufferedReader(
+                        new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8));
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = r.readLine()) != null) sb.append(line);
+                r.close();
+                org.json.JSONArray arr = new org.json.JSONArray(sb.toString());
+                Set<String> seen = new HashSet<>(
+                        prefs.getStringSet(KEY_SEEN, new HashSet<String>()));
+                boolean firstRun = seen.isEmpty() && !prefs.contains(KEY_SEEN);
+                boolean changed = false;
+                for (int i = 0; i < arr.length(); i++) {
+                    org.json.JSONObject o = arr.getJSONObject(i);
+                    String id = o.optString("id", "");
+                    String st = o.optString("status", "");
+                    if (id.isEmpty()) continue;
+                    if (("bitti".equals(st) || "hata".equals(st)) && !seen.contains(id)) {
+                        seen.add(id);
+                        changed = true;
+                        if (!firstRun) {
+                            final String title = o.optString("title", "is");
+                            final boolean ok = "bitti".equals(st);
+                            runOnUiThread(() -> notifyJob(title, ok));
+                        }
+                    }
+                }
+                if (changed || firstRun) {
+                    prefs.edit().putStringSet(KEY_SEEN, seen).apply();
+                }
+            } catch (Exception ignored) {
+            } finally {
+                if (c != null) c.disconnect();
+            }
+        }).start();
+    }
+
+    private void notifyJob(String title, boolean ok) {
+        Intent it = new Intent(this, MainActivity.class);
+        it.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        PendingIntent pi = PendingIntent.getActivity(
+                this, (int) System.currentTimeMillis(), it,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        Notification.Builder b;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            b = new Notification.Builder(this, CH_JOBS);
+        } else {
+            b = new Notification.Builder(this);
+        }
+        b.setContentTitle(ok ? "Video hazir" : "Is basarisiz")
+                .setContentText(title)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentIntent(pi)
+                .setAutoCancel(true);
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        nm.notify(title.hashCode(), b.build());
+        Toast.makeText(this, (ok ? "Hazir: " : "Basarisiz: ") + title,
+                Toast.LENGTH_LONG).show();
     }
 
     private String serverUrl() {
